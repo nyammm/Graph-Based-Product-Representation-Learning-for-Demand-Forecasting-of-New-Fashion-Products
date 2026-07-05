@@ -1,6 +1,5 @@
 import os
 import argparse
-import importlib.util
 from pathlib import Path
 from datetime import datetime
 
@@ -14,14 +13,23 @@ from tqdm import tqdm
 from utils.load_data import DataModule
 from utils.metric import get_score
 
+from models.Graph_Transformer import Graph_Transformer
+from models.GTM import GTM
+from models.Static_MLP import StaticMLPBaseline
+from models.Trend_Transformer import TrendTransformer
+
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-def load_module_from_path(path, module_name):
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "1"):
+        return True
+    if v.lower() in ("no", "false", "f", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
 def load_ckpt(model, ckpt_path):
@@ -31,18 +39,91 @@ def load_ckpt(model, ckpt_path):
     return model
 
 
+def build_model(args):
+    if args.model_type in ["ours", "graph"]:
+        return Graph_Transformer(
+            embedding_dim=args.embedding_dim,
+            hidden_dim=args.hidden_dim,
+            output_dim=args.output_dim,
+            num_heads=args.num_attn_heads,
+            num_layers=args.num_hidden_layers,
+            trend_len=args.trend_len,
+            num_trends=args.num_trends,
+            use_encoder_mask=args.use_encoder_mask,
+            gpu_num=args.gpu_num,
+            rescale_value=args.scale_value,
+            use_graph_item=args.use_graph_item,
+            use_img=args.use_image,
+            use_text=args.use_text,
+            use_signal=args.use_signal,
+        )
+
+    if args.model_type == "gtm":
+        return GTM(
+            embedding_dim=args.embedding_dim,
+            hidden_dim=args.hidden_dim,
+            output_dim=args.output_dim,
+            num_heads=args.num_attn_heads,
+            num_layers=args.num_hidden_layers,
+            trend_len=args.trend_len,
+            num_trends=args.num_trends,
+            use_encoder_mask=args.use_encoder_mask,
+            gpu_num=args.gpu_num,
+            rescale_value=args.scale_value,
+        )
+
+    if args.model_type == "static_mlp":
+        return StaticMLPBaseline(
+            hidden_dim=args.hidden_dim,
+            output_dim=args.output_dim,
+            use_item_branch=args.static_use_item,
+            use_img_branch=args.static_use_img,
+            use_text_branch=args.static_use_text,
+            use_temporal=args.static_use_temporal,
+            dropout=args.dropout,
+            rescale_value=args.scale_value,
+        )
+
+    if args.model_type == "trend_transformer":
+        return TrendTransformer(
+            hidden_dim=args.hidden_dim,
+            output_dim=args.output_dim,
+            num_heads=args.num_attn_heads,
+            num_layers=args.num_hidden_layers,
+            trend_len=args.trend_len,
+            num_trends=args.num_trends,
+            gpu_num=args.gpu_num,
+            use_encoder_mask=args.use_encoder_mask,
+            dropout=args.dropout,
+            rescale_value=args.scale_value,
+        )
+
+    raise ValueError(f"Unknown model_type: {args.model_type}")
+
+
 def forward_batch(model, batch, model_type):
-    if model_type == "gtm":
-        item_sales, temporal_features, gtrends, image_embs, text_embs = batch
-        pred = model(temporal_features, gtrends, image_embs, text_embs)
+    item_sales = batch[0]
+    
+    if model_type in ["ours", "graph"]:
+        pred = model(*batch[1:11])
+
+    elif model_type == "gtm":
+        pred = model(batch[1], batch[2], batch[4], batch[5])
+
+    elif model_type == "static_mlp":
+        pred = model(batch[1], batch[3], batch[4], batch[5])
+
+    elif model_type == "trend_transformer":
+        pred = model(batch[2])
+
     else:
-        item_sales, temporal_features, gtrends, items, image_embs, text_embs, neighbor_sales, neighbor_mask, neighbor_time_feats, neighbor_sims, neighbor_valid = batch
-        pred = model(temporal_features, gtrends, items, image_embs, text_embs, neighbor_sales, neighbor_mask, neighbor_time_feats, neighbor_sims, neighbor_valid)
+        raise ValueError(f"Unknown model_type: {model_type}")
 
     if isinstance(pred, dict):
         pred = pred.get("forecast", pred.get("pred", pred.get("preds", pred.get("y_hat", pred))))
     if isinstance(pred, (tuple, list)):
         pred = pred[0]
+
     return item_sales, pred
 
 
@@ -62,13 +143,14 @@ def inference(model, test_loader, model_type, device, scale_value, output_dim):
     forecasts = np.concatenate(forecasts, axis=0)
     rescaled_gt = gt * scale_value
     rescaled_forecasts = forecasts * scale_value
-    
+
     mae, wape, adj_smape, accum_smape = get_score(rescaled_gt, rescaled_forecasts)
-    
+
     print(f"MAE: {mae:.4f}")
     print(f"WAPE: {wape:.4f}")
     print(f"Adj-SMAPE: {adj_smape:.4f}")
     print(f"Accum-SMAPE: {accum_smape:.4f}")
+
     return gt, forecasts, rescaled_gt, rescaled_forecasts, {"mae": mae, "wape": wape, "adj_smape": adj_smape, "accum_smape": accum_smape}
 
 
@@ -76,6 +158,7 @@ def run(args):
     args.model_type = args.model_type.lower()
     args.data_dir = args.data_folder
     args.horizon = args.output_dim
+
     print(args, "\n")
     pl.seed_everything(args.seed, workers=True)
 
@@ -83,38 +166,7 @@ def run(args):
     dm.prepare_data()
     args.scale_value = dm.scale_value
 
-    if args.model_type == "gtm":
-        from models.GTM import GTM
-        model = GTM(
-            embedding_dim=args.embedding_dim,
-            hidden_dim=args.hidden_dim,
-            output_dim=args.output_dim,
-            num_heads=args.num_attn_heads,
-            num_layers=args.num_hidden_layers,
-            trend_len=args.trend_len,
-            num_trends=args.num_trends,
-            use_encoder_mask=args.use_encoder_mask,
-            gpu_num=args.gpu_num,
-            rescale_val=args.scale_value,
-        )
-    if args.model_type in ["ours", "graph"]:
-        from models.Graph_transformer import GraphForecast
-        model = GraphForecast(
-            embedding_dim=args.embedding_dim,
-            hidden_dim=args.hidden_dim,
-            output_dim=args.output_dim,
-            num_heads=args.num_attn_heads,
-            num_layers=args.num_hidden_layers,
-            trend_len=args.trend_len,
-            num_trends=args.num_trends,
-            use_encoder_mask=args.use_encoder_mask,
-            gpu_num=args.gpu_num,
-            rescale_val=args.scale_value,
-            use_graph_item=args.use_graph_item,
-            use_img=args.use_image,
-            use_text=args.use_text,
-            use_signal=args.use_signal,
-        )
+    model = build_model(args)
 
     string_dt = datetime.now().strftime("%y%m%d_%H%M")
     string_date = string_dt.split("_")[0]
@@ -125,28 +177,29 @@ def run(args):
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         dirpath=ckpt_dir,
         filename=f"{string_time}_{run_name}" + "---{epoch}---",
-        monitor="val_adj_smape",
+        monitor=args.monitor_metric,
         mode="min",
         save_top_k=1,
     )
 
-    wandb.init(entity=args.wandb_entity, project=args.wandb_proj, name=f"{run_name}_{string_dt}")
-    logger = pl_loggers.WandbLogger()
-    logger.watch(model)
-
-    trainer = pl.Trainer(
-        accelerator="gpu",
-        devices=[args.gpu_num],
-        max_epochs=args.epochs,
-        check_val_every_n_epoch=5,
-        logger=logger,
-        callbacks=[checkpoint_callback],
-        log_every_n_steps=10,
-    )
-
     if args.mode == "train":
+        wandb.init(entity=args.wandb_entity, project=args.wandb_proj, name=f"{run_name}_{string_dt}")
+        logger = pl_loggers.WandbLogger()
+        logger.watch(model)
+
+        trainer = pl.Trainer(
+            accelerator="gpu",
+            devices=[args.gpu_num],
+            max_epochs=args.epochs,
+            check_val_every_n_epoch=args.check_val_every_n_epoch,
+            logger=logger,
+            callbacks=[checkpoint_callback],
+            log_every_n_steps=10,
+        )
+
         trainer.fit(model, datamodule=dm)
         ckpt_path = checkpoint_callback.best_model_path
+
     else:
         if args.ckpt_path is None:
             raise ValueError("--ckpt_path is required when mode=test")
@@ -166,11 +219,24 @@ def run(args):
     result_dir = f"{args.result_path}/{string_date}_{args.wandb_run}"
     os.makedirs(result_dir, exist_ok=True)
     result_name = f"{Path(ckpt_path).stem}_{args.output_dim}.pth"
+
     torch.save(
-        {"results": rescaled_forecasts, "gts": rescaled_gt, "raw_results": forecasts, "raw_gts": gt, "codes": item_codes, "metrics": metrics, "scale_value": dm.scale_value, "ckpt_path": ckpt_path},
+        {
+            "results": rescaled_forecasts,
+            "gts": rescaled_gt,
+            "raw_results": forecasts,
+            "raw_gts": gt,
+            "codes": item_codes,
+            "metrics": metrics,
+            "scale_value": dm.scale_value,
+            "ckpt_path": ckpt_path,
+            "model_type": args.model_type,
+        },
         Path(result_dir) / result_name,
     )
+
     print("Result saved:", Path(result_dir) / result_name)
+    print("Model:", args.model_type)
 
 
 if __name__ == "__main__":
@@ -187,21 +253,32 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--ckpt_path", type=str, default=None)
 
-    parser.add_argument("--model_type", type=str, default="ours", choices=["gtm", "ours", "graph"])
+    parser.add_argument("--model_type", type=str, default="ours", choices=["gtm", "ours", "graph", "static_mlp", "trend_transformer"])
     parser.add_argument("--trend_len", type=int, default=52)
     parser.add_argument("--num_trends", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--embedding_dim", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=32)
     parser.add_argument("--output_dim", type=int, default=12)
+    parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--use_encoder_mask", type=int, default=1)
     parser.add_argument("--num_attn_heads", type=int, default=4)
     parser.add_argument("--num_hidden_layers", type=int, default=1)
     parser.add_argument("--top_k", type=int, default=10)
-    parser.add_argument("--use_graph_item", type=bool, default=True)
-    parser.add_argument("--use_text", type=bool, default=True)
-    parser.add_argument("--use_image", type=bool, default=True)
-    parser.add_argument("--use_signal", type=bool, default=True)
+    parser.add_argument("--monitor_metric", type=str, default="val_accum_smape")
+    parser.add_argument("--check_val_every_n_epoch", type=int, default=5)
+
+    # ours
+    parser.add_argument("--use_graph_item", type=str2bool, default=True)
+    parser.add_argument("--use_text", type=str2bool, default=True)
+    parser.add_argument("--use_image", type=str2bool, default=True)
+    parser.add_argument("--use_signal", type=str2bool, default=True)
+
+    # static mlp
+    parser.add_argument("--static_use_item", type=str2bool, default=True)
+    parser.add_argument("--static_use_img", type=str2bool, default=True)
+    parser.add_argument("--static_use_text", type=str2bool, default=True)
+    parser.add_argument("--static_use_temporal", type=str2bool, default=True)
 
     parser.add_argument("--wandb_entity", type=str, default="")
     parser.add_argument("--wandb_proj", type=str, default="")
